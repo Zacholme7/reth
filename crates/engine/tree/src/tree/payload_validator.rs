@@ -231,10 +231,10 @@ impl<'a, N: NodePrimitives> TreeCtx<'a, N> {
 /// Validation still queues JIT work and can use resident compiled code, but helper execution is
 /// paused during validation to minimize latency. Queued work resumes when validation exits, so JIT
 /// compilation is biased toward idle periods instead of competing with payload validation.
-struct JitPauseGuard<Evm: ConfigureEvm>(Evm);
+pub(super) struct JitPauseGuard<Evm: ConfigureEvm>(Evm);
 
 impl<Evm: ConfigureEvm> JitPauseGuard<Evm> {
-    fn new(evm_config: &Evm) -> Self {
+    pub(super) fn new(evm_config: &Evm) -> Self {
         if let Some(jit_backend) = evm_config.jit_backend() {
             jit_backend.pause();
         }
@@ -294,7 +294,9 @@ where
     ///
     /// None if txpool prewarming is disabled.
     #[debug(skip)]
-    txpool_prewarm: Option<txpool_prewarm::Handle<Evm::Primitives, P, Evm>>,
+    txpool_prewarm: Option<Arc<txpool_prewarm::Handle<Evm::Primitives, P, Evm>>>,
+    /// Opt-in independent payload state-root construction.
+    candidate_mode: Option<DefaultStateRootStrategy>,
 }
 
 impl<N, P, Evm, V> BasicEngineValidator<P, Evm, V>
@@ -354,6 +356,7 @@ where
             overlay_manager,
             state_root_strategy: Arc::new(DefaultStateRootStrategy::default()),
             txpool_prewarm: None,
+            candidate_mode: None,
         }
     }
 
@@ -366,16 +369,25 @@ where
         self
     }
 
+    /// Installs the non-preserving candidate-root pipeline used by multi-build payload jobs.
+    ///
+    /// This is an API-level construction choice. Generic and non-Ethereum validators retain the
+    /// standard payload-builder state-root path.
+    pub fn with_candidate_payload_state_roots(mut self) -> Self {
+        self.candidate_mode = Some(DefaultStateRootStrategy::default());
+        self
+    }
+
     /// Installs the txpool source and starts the persistent cache-prewarming worker.
     pub fn with_txpool_prewarming(
         mut self,
         source: impl crate::tree::TxPoolPrewarmSource<N> + 'static,
     ) -> Self {
-        self.txpool_prewarm = Some(txpool_prewarm::Handle::spawn(
+        self.txpool_prewarm = Some(Arc::new(txpool_prewarm::Handle::spawn(
             &self.runtime,
             Arc::new(source),
             self.evm_config.clone(),
-        ));
+        )));
         self
     }
 
@@ -475,7 +487,7 @@ where
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
     {
         let parent_hash = input.parent_hash();
-        let _txpool_pause = self.txpool_prewarm.as_ref().map(txpool_prewarm::Handle::pause);
+        let _txpool_pause = self.txpool_prewarm.as_ref().map(|handle| handle.pause());
         let txpool_snapshot =
             self.txpool_prewarm.as_ref().and_then(|prewarmer| prewarmer.snapshot(parent_hash));
         let _jit_pause = JitPauseGuard::new(&self.evm_config);
@@ -1906,6 +1918,26 @@ where
             .config
             .share_execution_cache_with_payload_builder()
             .then(|| self.payload_processor.cache_for(parent_hash));
+
+        if let Some(strategy) = &self.candidate_mode {
+            let overlay_factory = OverlayStateProviderFactory::new(
+                self.provider.clone(),
+                state.tree_state.overlay_manager.overlay_builder(parent_hash),
+            );
+            return PayloadBuilderResources::new_candidate(
+                execution_cache,
+                strategy.candidate_payload_builder_launcher(
+                    &self.runtime,
+                    parent_hash,
+                    parent_header,
+                    overlay_factory,
+                    &self.config,
+                    self.evm_config.clone(),
+                    self.txpool_prewarm.clone(),
+                ),
+            );
+        }
+
         let state_root_handle =
             self.payload_state_root_handle_for(parent_hash, parent_header, timestamp, state);
         let mut resources = PayloadBuilderResources::new(execution_cache, state_root_handle)

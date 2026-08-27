@@ -10,7 +10,7 @@ use crate::{
 };
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{BlockNumber, B256};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use reth_chain_state::{ExecutedBlock, PreservedSparseTrie};
 use reth_errors::ProviderResult;
 use reth_ethereum_primitives::EthPrimitives;
@@ -45,6 +45,8 @@ use tracing::{debug, trace};
 pub struct OverlayManager<N: NodePrimitives = EthPrimitives> {
     blocks: Arc<DashMap<B256, ExecutedBlock<N>>>,
     overlays: Arc<DashMap<OverlayCacheKey, OverlayCacheEntry>>,
+    /// Linearizes provider view construction with live-graph eviction.
+    view_lock: Arc<RwLock<()>>,
     changeset_cache: ChangesetCache,
     preserved_sparse_trie: Arc<Mutex<Option<PreservedSparseTrie>>>,
     #[cfg(feature = "rayon")]
@@ -69,6 +71,7 @@ impl<N: NodePrimitives> Default for OverlayManager<N> {
         Self {
             blocks: Default::default(),
             overlays: Default::default(),
+            view_lock: Default::default(),
             changeset_cache: Default::default(),
             preserved_sparse_trie: Default::default(),
             #[cfg(feature = "rayon")]
@@ -94,6 +97,7 @@ impl<N: NodePrimitives> OverlayManager<N> {
         Self {
             blocks: Default::default(),
             overlays: Default::default(),
+            view_lock: Default::default(),
             changeset_cache: Default::default(),
             preserved_sparse_trie: Default::default(),
             worker_pool: Some(worker_pool),
@@ -104,6 +108,16 @@ impl<N: NodePrimitives> OverlayManager<N> {
     /// Creates an overlay builder for `parent_hash`.
     pub fn overlay_builder(&self, parent_hash: B256) -> OverlayBuilder<N> {
         OverlayBuilder::new(parent_hash, self.clone())
+    }
+
+    /// Protects the live graph while a database snapshot is paired with its overlay.
+    pub(crate) fn read_view(&self) -> RwLockReadGuard<'_, ()> {
+        self.view_lock.read()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_write_view(&self) -> Option<parking_lot::RwLockWriteGuard<'_, ()>> {
+        self.view_lock.try_write()
     }
 
     pub(crate) const fn changeset_cache(&self) -> &ChangesetCache {
@@ -262,6 +276,7 @@ impl<N: NodePrimitives> OverlayManager<N> {
         )
     )]
     pub fn remove_blocks(&self, hashes: impl IntoIterator<Item = B256>) {
+        let _view = self.view_lock.write();
         let span = tracing::Span::current();
 
         // Remove blocks first, then prune overlays against the remaining block graph.
@@ -470,10 +485,16 @@ impl<N: NodePrimitives> OverlayManager<N> {
             if let Some(worker_pool) = &self.worker_pool {
                 let compute_span = _span;
                 let metrics = self.metrics.clone();
-                return Arc::new(worker_pool.install_fn(move || {
+                // The pool only runs the free compute below; block external callers without
+                // letting a cross-pool Rayon wait service their queues.
+                let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+                worker_pool.spawn(move || {
                     let _guard = compute_span.enter();
-                    compute_overlay(compute_input, anchor_hash, &metrics)
-                }))
+                    let _ = result_tx.send(compute_overlay(compute_input, anchor_hash, &metrics));
+                });
+                return Arc::new(
+                    result_rx.recv().expect("state trie overlay worker dropped its result"),
+                );
             }
         }
 
@@ -847,6 +868,44 @@ mod tests {
 
         let state = rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
         assert!(state.is_empty());
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn overlay_worker_does_not_service_caller_pool() {
+        let overlay_pool = Arc::new(WorkerPool::new(1, "overlay-test"));
+        let manager = OverlayManager::<EthPrimitives>::new(Arc::clone(&overlay_pool));
+        let caller_pool = WorkerPool::new(1, "overlay-caller-test");
+
+        let (overlay_entered_tx, overlay_entered_rx) = mpsc::channel();
+        let (release_overlay_tx, release_overlay_rx) = mpsc::channel();
+        overlay_pool.spawn(move || {
+            overlay_entered_tx.send(()).unwrap();
+            release_overlay_rx.recv().unwrap();
+        });
+        overlay_entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (compute_entered_tx, compute_entered_rx) = mpsc::channel();
+        let (computed_tx, computed_rx) = mpsc::channel();
+        caller_pool.spawn(move || {
+            compute_entered_tx.send(()).unwrap();
+            let input = ComputeOverlayInput::MergeBlocks(Vec::new());
+            manager.compute_overlay(input, B256::ZERO, tracing::Span::none());
+            computed_tx.send(()).unwrap();
+        });
+        compute_entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (nested_tx, nested_rx) = mpsc::channel();
+        caller_pool.spawn(move || nested_tx.send(()).unwrap());
+        let nested_ran = nested_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+
+        release_overlay_tx.send(()).unwrap();
+        computed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        if !nested_ran {
+            nested_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+
+        assert!(!nested_ran, "caller pool serviced nested work while awaiting the overlay");
     }
 
     #[test]

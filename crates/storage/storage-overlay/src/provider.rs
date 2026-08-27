@@ -128,6 +128,7 @@ where
     #[instrument(level = "debug", target = "providers::state::overlay", skip_all)]
     fn database_provider_ro(&self) -> ProviderResult<OverlayStateProvider<F::Provider>> {
         let overall_start = Instant::now();
+        let view = self.overlay_builder.read_view();
 
         // Get a read-only provider
         let provider = {
@@ -138,6 +139,7 @@ where
         };
 
         let overlay = self.get_overlay(&provider)?;
+        drop(view);
 
         let is_v2 = provider.cached_storage_settings().is_v2();
         self.metrics.database_provider_ro_duration.record(overall_start.elapsed());
@@ -267,6 +269,31 @@ mod tests {
         updates::TrieUpdatesSorted, BranchNodeCompact, ComputedTrieData, HashedPostState,
         HashedStorage, Nibbles,
     };
+    use std::{sync::Barrier, thread};
+
+    #[derive(Clone)]
+    struct PausedProviderFactory<F> {
+        inner: F,
+        opened: Arc<Barrier>,
+        resume: Arc<Barrier>,
+    }
+
+    impl<F: DatabaseProviderFactory> DatabaseProviderFactory for PausedProviderFactory<F> {
+        type DB = F::DB;
+        type Provider = F::Provider;
+        type ProviderRW = F::ProviderRW;
+
+        fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
+            let provider = self.inner.database_provider_ro()?;
+            self.opened.wait();
+            self.resume.wait();
+            Ok(provider)
+        }
+
+        fn database_provider_rw(&self) -> ProviderResult<Self::ProviderRW> {
+            self.inner.database_provider_rw()
+        }
+    }
 
     fn with_unique_trie_data(
         block: &ExecutedBlock<EthPrimitives>,
@@ -369,5 +396,30 @@ mod tests {
         assert_eq!(account_keys(&second), vec![B256::with_last_byte(4)]);
         assert_eq!(account_node_paths(&second), vec![Nibbles::from_nibbles([4])]);
         assert_eq!(overlay_factory.overlay_cache.len(), 2);
+    }
+
+    #[test]
+    fn provider_view_spans_database_open_and_overlay_materialization() {
+        let (factory, blocks) = setup_frontiers(3, 3);
+        let manager = OverlayManager::default();
+        manager.insert_block(blocks[4].clone());
+        let opened = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let overlay_factory = OverlayStateProviderFactory::new(
+            PausedProviderFactory {
+                inner: factory,
+                opened: Arc::clone(&opened),
+                resume: Arc::clone(&resume),
+            },
+            manager.overlay_builder(blocks[4].recovered_block().hash()),
+        );
+        let worker = thread::spawn(move || overlay_factory.database_provider_ro().unwrap());
+
+        opened.wait();
+        assert!(manager.try_write_view().is_none());
+        resume.wait();
+        let provider = worker.join().unwrap();
+        assert_eq!(account_keys(&provider.overlay), [B256::with_last_byte(5)]);
+        assert!(manager.try_write_view().is_some());
     }
 }

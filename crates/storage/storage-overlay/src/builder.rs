@@ -89,6 +89,10 @@ impl<N: NodePrimitives> OverlayBuilder<N> {
         }
     }
 
+    pub(crate) fn read_view(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.overlay_manager.read_view()
+    }
+
     /// Set the overlay source.
     ///
     /// This overlay will be applied on top of any reverts.

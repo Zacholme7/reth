@@ -40,7 +40,7 @@
 //! ```
 
 use crate::{HashBuilder, Nibbles, EMPTY_ROOT_HASH};
-use alloc::vec::Vec;
+use alloc::sync::Arc;
 use alloy_primitives::B256;
 
 /// First index whose RLP-encoded key sorts after index 0.
@@ -58,13 +58,13 @@ const ZERO_KEY_FLUSH_INDEX: usize = 0x80;
 /// This builder is intended for transaction and receipt root computation while a block is still
 /// being built. It buffers only index `0`, then streams all other leaves directly into the
 /// [`HashBuilder`] in the same order as `alloy_trie::root::ordered_trie_root_encoded`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct OrderedTrieRootEncodedBuilder {
     /// Number of items pushed so far. This is also the next append-only index.
     len: usize,
     /// Index 0 is the only item whose final insertion position depends on whether more items
     /// arrive.
-    zero: Option<Vec<u8>>,
+    zero: Option<Arc<[u8]>>,
     /// The underlying hash builder.
     hb: HashBuilder,
 }
@@ -85,7 +85,7 @@ impl OrderedTrieRootEncodedBuilder {
 
         match index {
             0 => {
-                self.zero = Some(bytes.to_vec());
+                self.zero = Some(Arc::from(bytes));
             }
             1..=0x7f => {
                 self.add_leaf(index, bytes);
@@ -132,7 +132,7 @@ impl OrderedTrieRootEncodedBuilder {
         }
 
         let zero = self.zero.take().expect("index 0 must be buffered before it is flushed");
-        self.add_leaf(0, &zero);
+        self.add_leaf(0, zero.as_ref());
     }
 
     fn add_leaf(&mut self, index: usize, bytes: &[u8]) {
@@ -144,6 +144,7 @@ impl OrderedTrieRootEncodedBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
     use alloy_trie::root::ordered_trie_root_encoded;
     use proptest::prelude::*;
 
@@ -244,6 +245,46 @@ mod tests {
 
         assert_eq!(builder.pushed_count(), 129);
         assert_eq!(builder.finalize(), expected);
+    }
+
+    #[test]
+    fn cloned_builders_are_independent_continuations() {
+        for split in [0, 1, 2, 127, 128, 129, 200] {
+            let prefix = items(split);
+            let mut left = OrderedTrieRootEncodedBuilder::new();
+            for item in &prefix {
+                left.push_next(item);
+            }
+            let mut right = left.clone();
+
+            let left_tail = b"left_tail".to_vec();
+            let right_tail = b"right_tail".to_vec();
+            left.push_next(&left_tail);
+            right.push_next(&right_tail);
+
+            let mut left_items = prefix.clone();
+            left_items.push(left_tail);
+            let mut right_items = prefix;
+            right_items.push(right_tail);
+
+            assert_eq!(left.finalize(), ordered_trie_root_encoded(&left_items));
+            assert_eq!(right.finalize(), ordered_trie_root_encoded(&right_items));
+        }
+    }
+
+    #[test]
+    fn clone_shares_large_buffered_zero_leaf() {
+        let first = vec![0x42; 1024 * 1024];
+        let mut builder = OrderedTrieRootEncodedBuilder::new();
+        builder.push_next(&first);
+
+        let clone = builder.clone();
+
+        assert!(Arc::ptr_eq(
+            builder.zero.as_ref().expect("first leaf is buffered"),
+            clone.zero.as_ref().expect("cloned first leaf is buffered"),
+        ));
+        assert_eq!(clone.finalize(), ordered_trie_root_encoded(&[first]));
     }
 
     proptest! {
