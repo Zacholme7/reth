@@ -132,7 +132,7 @@ impl AvailabilitySheet {
 /// The handle stores direct senders to both storage and account worker pools,
 /// eliminating the need for a routing thread. All handles share reference-counted
 /// channels, and workers shut down gracefully when all handles are dropped.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct ProofWorkerHandle {
     /// Direct sender to storage worker pool
     storage_work_tx: CrossbeamSender<StorageWorkerJob>,
@@ -179,59 +179,16 @@ impl ProofWorkerHandle {
             + Sync
             + 'static,
     {
-        Self::spawn(runtime, task_ctx, halve_workers, proof_result_tx, false, Arc::default(), ())
-    }
-
-    /// Spawns a candidate-owned worker set sized for two concurrent candidate roots.
-    pub fn new_candidate<Factory, Lease>(
-        runtime: &Runtime,
-        task_ctx: ProofTaskCtx<Factory>,
-        proof_result_tx: ProofResultSender,
-        cached_storage_roots: Arc<DashMap<B256, B256>>,
-        lease: Lease,
-    ) -> Self
-    where
-        Factory: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        Lease: Clone + Send + Sync + 'static,
-    {
-        Self::spawn(runtime, task_ctx, true, proof_result_tx, true, cached_storage_roots, lease)
-    }
-
-    fn spawn<Factory, Lease>(
-        runtime: &Runtime,
-        task_ctx: ProofTaskCtx<Factory>,
-        halve_workers: bool,
-        proof_result_tx: ProofResultSender,
-        candidate: bool,
-        cached_storage_roots: Arc<DashMap<B256, B256>>,
-        lease: Lease,
-    ) -> Self
-    where
-        Factory: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        Lease: Clone + Send + Sync + 'static,
-    {
         let (storage_work_tx, storage_work_rx) = unbounded::<StorageWorkerJob>();
         let (account_work_tx, account_work_rx) = unbounded::<AccountWorkerJob>();
-        let storage_capacity = runtime.proof_storage_worker_pool().current_num_threads();
-        let account_capacity = runtime.proof_account_worker_pool().current_num_threads();
-        let (storage_worker_count, account_worker_count) = if candidate {
-            let budget = (runtime.cpu_pool().current_num_threads() / 2).max(2);
-            (
-                budget.div_ceil(2).min(storage_capacity).max(1),
-                (budget / 2).min(account_capacity).max(1),
-            )
-        } else {
-            let divisor = if halve_workers { 2 } else { 1 };
-            (storage_capacity / divisor, account_capacity / divisor)
-        };
+        let cached_storage_roots = Arc::<DashMap<_, _>>::default();
+
+        let divisor = if halve_workers { 2 } else { 1 };
+        let storage_worker_count =
+            runtime.proof_storage_worker_pool().current_num_threads() / divisor;
+        let account_worker_count =
+            runtime.proof_account_worker_pool().current_num_threads() / divisor;
+
         let storage_availability = Arc::new(AvailabilitySheet::new(storage_worker_count));
         let account_availability = Arc::new(AvailabilitySheet::new(account_worker_count));
 
@@ -240,10 +197,12 @@ impl ProofWorkerHandle {
             storage_worker_count,
             account_worker_count,
             halve_workers,
-            candidate,
             "Spawning proof worker pools"
         );
 
+        // Each worker is one spawned job that blocks on its channel until every handle is
+        // dropped. Spawning instead of broadcasting keeps the pool's other threads free, so
+        // worker sets for different payloads can coexist without waiting on each other.
         let storage_parent_span = tracing::Span::current();
         for worker_id in 0..storage_worker_count {
             let storage_task_ctx = task_ctx.clone();
@@ -252,9 +211,7 @@ impl ProofWorkerHandle {
             let storage_roots = cached_storage_roots.clone();
             let storage_result_tx = proof_result_tx.clone();
             let storage_parent_span = storage_parent_span.clone();
-            let storage_lease = lease.clone();
             runtime.proof_storage_worker_pool().spawn(move || {
-                let _lease = storage_lease;
                 let span = debug_span!(target: "trie::proof_task", parent: storage_parent_span, "storage_worker", ?worker_id);
                 let _guard = span.enter();
 
@@ -301,9 +258,7 @@ impl ProofWorkerHandle {
             let cached_storage_roots = cached_storage_roots.clone();
             let account_result_tx = proof_result_tx.clone();
             let account_parent_span = account_parent_span.clone();
-            let account_lease = lease.clone();
             runtime.proof_account_worker_pool().spawn(move || {
-                let _lease = account_lease;
                 let span = debug_span!(target: "trie::proof_task", parent: account_parent_span, "account_worker", ?worker_id);
                 let _guard = span.enter();
 
@@ -714,6 +669,7 @@ where
             instrumented_trie_cursor,
             instrumented_hashed_cursor,
         );
+
         // Initially mark this worker as available.
         self.availability.mark_idle(self.worker_id);
 
@@ -963,6 +919,7 @@ where
                 instrumented_storage_trie_cursor,
                 instrumented_storage_hashed_cursor,
             )));
+
         // Count this worker as available only after successful initialization.
         self.availability.mark_idle(self.worker_id);
 
@@ -1220,66 +1177,9 @@ enum AccountWorkerJob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::B256;
     use reth_chainspec::ChainSpec;
-    use reth_primitives_traits::Account;
     use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
-    use reth_storage_errors::db::DatabaseError;
-    use reth_trie::{
-        hashed_cursor::noop::{NoopHashedCursor, NoopHashedCursorFactory},
-        trie_cursor::noop::{NoopAccountTrieCursor, NoopStorageTrieCursor, NoopTrieCursorFactory},
-    };
-    use std::{sync::Arc, time::Duration};
-
-    #[derive(Clone, Debug, Default)]
-    struct NoopProofFactory;
-
-    #[derive(Debug, Default)]
-    struct NoopProofProvider {
-        trie: NoopTrieCursorFactory,
-        hashed: NoopHashedCursorFactory,
-    }
-
-    impl DatabaseProviderROFactory for NoopProofFactory {
-        type Provider = NoopProofProvider;
-
-        fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
-            reth_tasks::WorkerPool::with_worker_mut(|_| {});
-            Ok(NoopProofProvider::default())
-        }
-    }
-
-    impl TrieCursorFactory for NoopProofProvider {
-        type AccountTrieCursor<'a> = NoopAccountTrieCursor;
-        type StorageTrieCursor<'a> = NoopStorageTrieCursor;
-
-        fn account_trie_cursor(&self) -> Result<Self::AccountTrieCursor<'_>, DatabaseError> {
-            self.trie.account_trie_cursor()
-        }
-
-        fn storage_trie_cursor(
-            &self,
-            hashed_address: B256,
-        ) -> Result<Self::StorageTrieCursor<'_>, DatabaseError> {
-            self.trie.storage_trie_cursor(hashed_address)
-        }
-    }
-
-    impl HashedCursorFactory for NoopProofProvider {
-        type AccountCursor<'a> = NoopHashedCursor<Account>;
-        type StorageCursor<'a> = NoopHashedCursor<U256>;
-
-        fn hashed_account_cursor(&self) -> Result<Self::AccountCursor<'_>, DatabaseError> {
-            self.hashed.hashed_account_cursor()
-        }
-
-        fn hashed_storage_cursor(
-            &self,
-            hashed_address: B256,
-        ) -> Result<Self::StorageCursor<'_>, DatabaseError> {
-            self.hashed.hashed_storage_cursor(hashed_address)
-        }
-    }
+    use std::sync::Arc;
 
     fn test_ctx<Factory>(factory: Factory) -> ProofTaskCtx<Factory> {
         ProofTaskCtx::new(factory)
@@ -1309,69 +1209,5 @@ mod tests {
 
         // Workers shut down automatically when handle is dropped
         drop(proof_handle);
-    }
-
-    #[test]
-    fn candidate_workers_do_not_hold_worker_tls() {
-        let factory = NoopProofFactory;
-        let runtime = reth_tasks::Runtime::test();
-        assert_eq!(runtime.proof_storage_worker_pool().current_num_threads(), 2);
-        assert_eq!(runtime.proof_account_worker_pool().current_num_threads(), 2);
-
-        let cached_storage_roots = Arc::default();
-        let (first_result_tx, first_result_rx) = unbounded();
-        let first_dispatch_tx = first_result_tx.clone();
-        let first = ProofWorkerHandle::new_candidate(
-            &runtime,
-            test_ctx(factory.clone()),
-            first_result_tx,
-            Arc::clone(&cached_storage_roots),
-            (),
-        );
-        first
-            .dispatch_account_multiproof(AccountMultiproofInput {
-                targets: MultiProofTargetsV2::default(),
-                proof_result_sender: ProofResultContext::new(
-                    first_dispatch_tx,
-                    HashedPostState::default(),
-                    Instant::now(),
-                ),
-            })
-            .expect("first candidate proof should dispatch");
-        let proof = first_result_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("first candidate proof did not drain");
-        assert!(proof.result.is_ok(), "first candidate proof failed: {:?}", proof.result);
-        assert_eq!(first.total_storage_workers(), 1);
-        assert_eq!(first.total_account_workers(), 1);
-
-        let (second_result_tx, second_result_rx) = unbounded();
-        let second_dispatch_tx = second_result_tx.clone();
-        let second = ProofWorkerHandle::new_candidate(
-            &runtime,
-            test_ctx(factory),
-            second_result_tx,
-            cached_storage_roots,
-            (),
-        );
-        second
-            .dispatch_account_multiproof(AccountMultiproofInput {
-                targets: MultiProofTargetsV2::default(),
-                proof_result_sender: ProofResultContext::new(
-                    second_dispatch_tx,
-                    HashedPostState::default(),
-                    Instant::now(),
-                ),
-            })
-            .expect("second candidate proof should dispatch");
-        let proof = second_result_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("second candidate did not drain proof work while the first remained live");
-        assert!(proof.result.is_ok(), "second candidate proof failed: {:?}", proof.result);
-        assert_eq!(second.pending_account_tasks(), 0);
-        assert_eq!(second.pending_storage_tasks(), 0);
-
-        drop((second, first));
-        drop(runtime);
     }
 }

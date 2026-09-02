@@ -65,10 +65,9 @@ use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender
 use reth_chain_state::{ExecutedBlock, PreservedSparseTrie};
 use reth_errors::ProviderResult;
 use reth_evm::{ConfigureEvm, OnStateHook};
-use reth_payload_builder::{PayloadBuilderLease, PayloadStateRootJob, PayloadStateRootJobLauncher};
+use reth_payload_builder::PayloadStateRootLauncher;
 use reth_primitives_traits::{
-    dashmap::DashMap, AlloyBlockHeader, FastInstant as Instant, NodePrimitives, RecoveredBlock,
-    SealedHeader,
+    AlloyBlockHeader, FastInstant as Instant, NodePrimitives, RecoveredBlock, SealedHeader,
 };
 use reth_provider::{
     BlockExecutionOutput, BlockNumReader, ChangeSetReader, DatabaseProviderFactory,
@@ -86,9 +85,9 @@ use reth_trie_parallel::proof_task::{ProofResultMessage, ProofTaskCtx, ProofWork
 pub use reth_trie_parallel::{
     error::StateRootTaskError,
     state_root_task::{
-        evm_state_to_hashed_post_state, state_root_streams, PayloadStateRootHandle,
+        evm_state_to_hashed_post_state, PayloadStateRootHandle, StateAccessHint,
         StateRootComputeOutcome, StateRootHandle, StateRootHintStream, StateRootMessage,
-        StateRootTaskCancelGuard, StateRootUpdateHook, StateRootUpdateStream,
+        StateRootSink, StateRootTaskCancelGuard, StateRootUpdateHook, StateRootUpdateStream,
     },
 };
 #[cfg(feature = "trie-debug")]
@@ -104,7 +103,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::oneshot;
 use tracing::{debug, debug_span, instrument, warn, Span};
 
 /// Handle to a [`HashedPostState`] computed on a background thread.
@@ -497,7 +495,7 @@ type SerialFallbackRx = mpsc::Receiver<ProviderResult<(B256, TrieUpdates, Arc<Ha
 ///
 /// Custom strategies can hold this type and delegate to it for blocks where they want the
 /// default behavior.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct DefaultStateRootStrategy {
     metrics: SparseTrieTaskMetrics,
 }
@@ -514,6 +512,9 @@ impl DefaultStateRootStrategy {
     const SMALL_BLOCK_PROOF_WORKER_TX_THRESHOLD: usize = 30;
 
     /// Creates a launcher for independent, non-preserving payload-builder root jobs.
+    ///
+    /// Every job shares one proof worker set and one JIT/prewarm pause, both released with the
+    /// launcher.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn candidate_payload_builder_launcher<N, P, Evm>(
         &self,
@@ -524,7 +525,7 @@ impl DefaultStateRootStrategy {
         config: &TreeConfig,
         evm_config: Evm,
         txpool_prewarm: Option<Arc<txpool_prewarm::Handle<N, P, Evm>>>,
-    ) -> PayloadStateRootJobLauncher
+    ) -> PayloadStateRootLauncher
     where
         N: NodePrimitives,
         P: DatabaseProviderFactory + Clone + 'static,
@@ -541,116 +542,39 @@ impl DefaultStateRootStrategy {
             + 'static,
         Evm: ConfigureEvm<Primitives = N> + 'static,
     {
+        let strategy = self.clone();
         let executor = executor.clone();
-        let parent_state_root = parent_header.state_root();
-        let new_epoch = TrieNodeEpoch::new(parent_header.number().saturating_add(1));
-        let chunk_size = config.multiproof_chunk_size();
+        let config = config.clone();
+        let parent_header = SealedHeader::new(parent_header.clone(), parent_hash);
+        let task_ctx = ProofTaskCtx::new(overlay_factory);
         #[cfg(feature = "trie-debug")]
-        let proof_jitter = config.proof_jitter();
-        let metrics = self.metrics.clone();
-        // Storage roots come exclusively from this launcher's exact-parent provider. Candidate
-        // deltas are applied by the sparse trie after proofs are fetched, so the address-keyed
-        // roots are identical across every generational/full candidate in this launcher cohort.
-        let cached_storage_roots = Arc::<DashMap<B256, B256>>::default();
+        let task_ctx = task_ctx.with_proof_jitter(config.proof_jitter());
+        // Worker start-up failures surface as dispatch errors on the jobs themselves.
+        let (worker_failures, _) = crossbeam_channel::unbounded();
+        let proof_handle = ProofWorkerHandle::new(&executor, task_ctx, true, worker_failures);
+        let lease =
+            (JitPauseGuard::new(&evm_config), txpool_prewarm.as_ref().map(|handle| handle.pause()));
 
-        PayloadStateRootJobLauncher::new(move || {
-            let worker_lease = PayloadBuilderLease::new((
-                JitPauseGuard::new(&evm_config),
-                txpool_prewarm.as_ref().map(|handle| handle.pause()),
-            ));
-            Self::spawn_candidate_state_root(
-                executor.clone(),
-                overlay_factory.clone(),
-                parent_hash,
-                parent_state_root,
-                new_epoch,
-                chunk_size,
-                #[cfg(feature = "trie-debug")]
-                proof_jitter,
-                metrics.clone(),
-                Arc::clone(&cached_storage_roots),
-                worker_lease,
-            )
-        })
-    }
-
-    /// Spawns one fresh sparse-trie task whose result is prepared on its owning blocking worker.
-    #[expect(clippy::too_many_arguments)]
-    fn spawn_candidate_state_root<F>(
-        executor: reth_tasks::Runtime,
-        multiproof_provider_factory: F,
-        parent_hash: B256,
-        parent_state_root: B256,
-        new_epoch: TrieNodeEpoch,
-        chunk_size: usize,
-        #[cfg(feature = "trie-debug")] proof_jitter: Option<Duration>,
-        metrics: SparseTrieTaskMetrics,
-        cached_storage_roots: Arc<DashMap<B256, B256>>,
-        worker_lease: PayloadBuilderLease,
-    ) -> Result<PayloadStateRootJob, StateRootTaskError>
-    where
-        F: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-    {
-        let (updates_tx, updates_rx) = crossbeam_channel::unbounded();
-        let (cancel_guard, cancel_rx) = StateRootTaskCancelGuard::channel();
-        let (proof_result_tx, proof_result_rx) =
-            crossbeam_channel::unbounded::<ProofResultMessage>();
-        let (result_tx, result_rx) = oneshot::channel();
-        let (final_hashed_state_tx, final_hashed_state_rx) = mpsc::channel();
-        drop(final_hashed_state_rx);
-
-        let task_ctx = ProofTaskCtx::new(multiproof_provider_factory);
-        #[cfg(feature = "trie-debug")]
-        let task_ctx = task_ctx.with_proof_jitter(proof_jitter);
-        let proof_handle = ProofWorkerHandle::new_candidate(
-            &executor,
-            task_ctx,
-            proof_result_tx.clone(),
-            cached_storage_roots,
-            worker_lease.clone(),
-        );
-        let task_executor = executor.clone();
-        executor.spawn_blocking_named_or_tokio("candidate-sparse-trie", move || {
-            let _worker_lease = worker_lease;
-            let default_trie = RevealableSparseTrie::blind_from(ArenaParallelSparseTrie::default());
-            let sparse_state_trie = SparseStateTrie::default()
-                .with_accounts_trie(default_trie.clone())
-                .with_default_storage_trie(default_trie)
-                .with_updates(true);
-            let mut task = SparseTrieCacheTask::new_with_trie(
-                &task_executor,
-                updates_rx,
-                cancel_rx,
-                final_hashed_state_tx,
-                proof_handle,
-                proof_result_tx,
-                proof_result_rx,
-                metrics,
-                sparse_state_trie,
-                parent_state_root,
-                new_epoch,
-                chunk_size,
-                true,
+        PayloadStateRootLauncher::new(move || {
+            // Referenced so the closure owns the pause for the launcher's lifetime.
+            let _lease = &lease;
+            let mut handle = strategy.spawn_state_root::<N, OverlayStateProviderFactory<P, N>>(
+                &executor,
+                None,
+                ProofWorkers::Shared(proof_handle.clone()),
+                StateRootTaskOptions {
+                    parent_header: parent_header.clone(),
+                    preserved_sparse_trie: None,
+                    transaction_count: None,
+                    config: &config,
+                    pending_sparse_trie_prune_blocks: None,
+                },
             );
-
-            let result = task.run().map(|outcome| (parent_hash, outcome));
-            // Independent jobs never publish their sparse trie.
-            let (trie, deferred) = task.into_trie_for_reuse();
-            task_executor.spawn_drop(trie);
-            task_executor.spawn_drop(deferred);
-
-            if let Err(Ok((_, outcome))) = result_tx.send(result) {
-                task_executor.spawn_drop(outcome);
-            }
-        });
-
-        let (updates, hint) = state_root_streams(updates_tx);
-        let hook = updates.into_state_hook();
-        Ok(PayloadStateRootJob::new(hook, hint, result_rx, cancel_guard))
+            // A candidate never consumes the hashed state; dropping its receiver keeps the
+            // outcome uniquely owned by the caller.
+            drop(handle.take_hashed_state_rx());
+            handle
+        })
     }
 
     /// Spawns the default state-root computation pipeline.
@@ -658,12 +582,15 @@ impl DefaultStateRootStrategy {
     /// The authoritative update capability taken from the returned handle must be dropped or
     /// explicitly finished after execution so the task observes the end of the update stream.
     /// An unknown transaction count uses the full proof-worker pool.
+    ///
+    /// `overlay_manager` is `None` for detached candidate jobs, which never publish their trie
+    /// and may share their proof workers with sibling candidates.
     #[instrument(level = "debug", target = "engine::tree::payload_processor", skip_all)]
     fn spawn_state_root<N, F>(
         &self,
         executor: &reth_tasks::Runtime,
-        overlay_manager: &OverlayManager<N>,
-        multiproof_provider_factory: F,
+        overlay_manager: Option<&OverlayManager<N>>,
+        proof_workers: ProofWorkers<F>,
         options: StateRootTaskOptions<'_, N>,
     ) -> StateRootHandle
     where
@@ -686,13 +613,17 @@ impl DefaultStateRootStrategy {
         let (proof_result_tx, proof_result_rx) =
             crossbeam_channel::unbounded::<ProofResultMessage>();
 
-        let task_ctx = ProofTaskCtx::new(multiproof_provider_factory);
-        #[cfg(feature = "trie-debug")]
-        let task_ctx = task_ctx.with_proof_jitter(config.proof_jitter());
-        let halve_workers = transaction_count
-            .is_some_and(|count| count <= Self::SMALL_BLOCK_PROOF_WORKER_TX_THRESHOLD);
-        let proof_handle =
-            ProofWorkerHandle::new(executor, task_ctx, halve_workers, proof_result_tx.clone());
+        let proof_handle = match proof_workers {
+            ProofWorkers::Fresh(factory) => {
+                let task_ctx = ProofTaskCtx::new(factory);
+                #[cfg(feature = "trie-debug")]
+                let task_ctx = task_ctx.with_proof_jitter(config.proof_jitter());
+                let halve_workers = transaction_count
+                    .is_some_and(|count| count <= Self::SMALL_BLOCK_PROOF_WORKER_TX_THRESHOLD);
+                ProofWorkerHandle::new(executor, task_ctx, halve_workers, proof_result_tx.clone())
+            }
+            ProofWorkers::Shared(handle) => handle,
+        };
 
         let (state_root_tx, state_root_rx) = mpsc::channel();
         let (hashed_state_tx, hashed_state_rx) = mpsc::channel();
@@ -730,11 +661,14 @@ impl DefaultStateRootStrategy {
     }
 
     /// Spawns the sparse-trie task and preserves its trie for the next state-root job.
+    ///
+    /// Without an overlay manager the task is a detached candidate: it runs off the named
+    /// worker so siblings never queue behind each other, and its trie is dropped after use.
     #[expect(clippy::too_many_arguments)]
     fn spawn_sparse_trie_task<N: NodePrimitives>(
         &self,
         executor: &reth_tasks::Runtime,
-        overlay_manager: &OverlayManager<N>,
+        overlay_manager: Option<&OverlayManager<N>>,
         proof_worker_handle: ProofWorkerHandle,
         proof_result_tx: CrossbeamSender<ProofResultMessage>,
         proof_result_rx: CrossbeamReceiver<ProofResultMessage>,
@@ -750,12 +684,14 @@ impl DefaultStateRootStrategy {
             chunk_size,
             pending_sparse_trie_prune_blocks,
         } = options;
-        let overlay_manager = overlay_manager.clone();
+        let detached = overlay_manager.is_none();
+        let overlay_manager = overlay_manager.cloned();
         let trie_metrics = self.metrics.clone();
         let executor = executor.clone();
+        let spawner = executor.clone();
 
         let parent_span = Span::current();
-        executor.clone().spawn_blocking_named("sparse-trie", move || {
+        let task = move || {
             reth_tasks::once!(increase_thread_priority);
 
             let parent_hash = parent_header.hash();
@@ -824,10 +760,16 @@ impl DefaultStateRootStrategy {
                 parent_state_root,
                 new_epoch,
                 chunk_size,
-                false,
             );
 
             let result = task.run();
+            let Some(overlay_manager) = overlay_manager else {
+                let _ = state_root_tx.send(result);
+                let (trie, deferred) = task.into_cleared_trie();
+                executor.spawn_drop(trie);
+                executor.spawn_drop(deferred);
+                return;
+            };
             let task_result = result.as_ref().ok().cloned();
 
             // Publish a handle before sending the result so the next block can inspect the
@@ -902,7 +844,12 @@ impl DefaultStateRootStrategy {
                 executor.spawn_drop(trie);
             }
             executor.spawn_drop(deferred);
-        });
+        };
+        if detached {
+            spawner.spawn_blocking_named_or_tokio("candidate-sparse-trie", task);
+        } else {
+            spawner.spawn_blocking_named("sparse-trie", task);
+        }
     }
 }
 
@@ -912,6 +859,14 @@ struct SparseTrieTaskOptions<N: NodePrimitives> {
     chunk_size: usize,
     /// `None` disables pruning. `Some(Vec::new())` prunes nodes older than the current block.
     pending_sparse_trie_prune_blocks: Option<Vec<ExecutedBlock<N>>>,
+}
+
+/// Proof workers serving one state-root task.
+enum ProofWorkers<F> {
+    /// Spawn a worker set sized for this task.
+    Fresh(F),
+    /// Reuse a launcher-owned worker set shared by sibling candidates.
+    Shared(ProofWorkerHandle),
 }
 
 struct StateRootTaskOptions<'a, N: NodePrimitives> {
@@ -1017,8 +972,8 @@ where
 
         let mut handle = self.spawn_state_root(
             executor,
-            overlay_manager,
-            overlay_factory.clone(),
+            Some(overlay_manager),
+            ProofWorkers::Fresh(overlay_factory.clone()),
             StateRootTaskOptions {
                 parent_header: parent_header.clone(),
                 preserved_sparse_trie,
@@ -1093,8 +1048,8 @@ where
         Ok(Some(
             self.spawn_state_root(
                 ctx.executor,
-                ctx.overlay_manager,
-                overlay_factory,
+                Some(ctx.overlay_manager),
+                ProofWorkers::Fresh(overlay_factory),
                 StateRootTaskOptions {
                     parent_header,
                     preserved_sparse_trie,
@@ -1497,7 +1452,7 @@ mod tests {
     use reth_primitives_traits::{Account, StorageEntry};
     use reth_provider::{
         providers::BlockchainProvider, test_utils::create_test_provider_factory_with_chain_spec,
-        HashingWriter,
+        HashingWriter, HeaderProvider,
     };
     use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
     use reth_testing_utils::generators;
@@ -1505,43 +1460,39 @@ mod tests {
     use revm::state::{AccountInfo, AccountStatus, EvmState, EvmStorageSlot, TransactionId};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn candidate_finish_returns_parent_bound_outcome() {
+    async fn candidate_launcher_yields_uniquely_owned_parent_outcome() {
         static RUNTIME: std::sync::LazyLock<reth_tasks::Runtime> =
             std::sync::LazyLock::new(reth_tasks::Runtime::test);
 
         let chain_spec: Arc<ChainSpec> = Arc::new(ChainSpec::default());
         let parent_state_root = chain_spec.genesis_header().state_root;
-        let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
         let genesis_hash = init_genesis(&factory).unwrap();
         let overlay_manager = OverlayManager::<EthPrimitives>::default();
-        let overlay_builder = overlay_manager.overlay_builder(genesis_hash);
-        let overlay_factory =
-            OverlayStateProviderFactory::new(factory.clone(), overlay_builder.clone());
-        let mut job = DefaultStateRootStrategy::spawn_candidate_state_root(
-            RUNTIME.clone(),
-            overlay_factory,
+        let overlay_factory = OverlayStateProviderFactory::new(
+            factory.clone(),
+            overlay_manager.overlay_builder(genesis_hash),
+        );
+        let launcher = DefaultStateRootStrategy::default().candidate_payload_builder_launcher(
+            &RUNTIME.clone(),
             genesis_hash,
-            parent_state_root,
-            TrieNodeEpoch::new(1),
-            100,
-            #[cfg(feature = "trie-debug")]
+            factory.sealed_header(0).unwrap().unwrap().header(),
+            overlay_factory,
+            &TreeConfig::default(),
+            reth_evm_ethereum::EthEvmConfig::new(chain_spec),
             None,
-            SparseTrieTaskMetrics::default(),
-            Arc::default(),
-            PayloadBuilderLease::new(()),
-        )
-        .unwrap();
-        drop(job.take_state_hook());
+        );
 
-        let (parent_hash, outcome) = tokio::time::timeout(Duration::from_secs(2), job.finish())
-            .await
-            .expect("candidate finish timed out")
-            .unwrap();
+        for _ in 0..2 {
+            let mut handle = launcher.start();
+            drop(handle.take_execution_hook());
+            let outcome =
+                tokio::task::spawn_blocking(move || handle.state_root()).await.unwrap().unwrap();
 
-        assert_eq!(parent_hash, genesis_hash);
-        assert_eq!(outcome.state_root, parent_state_root);
-        assert!(outcome.hashed_state.is_empty());
-        assert!(outcome.trie_updates.is_empty());
+            assert_eq!(outcome.state_root, parent_state_root);
+            assert_eq!(Arc::strong_count(&outcome.hashed_state), 1);
+            assert_eq!(Arc::strong_count(&outcome.trie_updates), 1);
+        }
     }
 
     #[test]
@@ -1696,11 +1647,11 @@ mod tests {
         let overlay_manager = OverlayManager::<EthPrimitives>::default();
         let mut state_root_handle = DefaultStateRootStrategy::default().spawn_state_root(
             &runtime,
-            &overlay_manager,
-            OverlayStateProviderFactory::new(
+            Some(&overlay_manager),
+            ProofWorkers::Fresh(OverlayStateProviderFactory::new(
                 provider_factory,
                 overlay_manager.overlay_builder(genesis_hash),
-            ),
+            )),
             StateRootTaskOptions {
                 parent_header: SealedHeader::new(Default::default(), genesis_hash),
                 preserved_sparse_trie: None,

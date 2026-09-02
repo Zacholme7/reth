@@ -40,7 +40,7 @@
 //! ```
 
 use crate::{HashBuilder, Nibbles, EMPTY_ROOT_HASH};
-use alloc::sync::Arc;
+use alloc::vec::Vec;
 use alloy_primitives::B256;
 
 /// First index whose RLP-encoded key sorts after index 0.
@@ -64,7 +64,7 @@ pub struct OrderedTrieRootEncodedBuilder {
     len: usize,
     /// Index 0 is the only item whose final insertion position depends on whether more items
     /// arrive.
-    zero: Option<Arc<[u8]>>,
+    zero: Option<Vec<u8>>,
     /// The underlying hash builder.
     hb: HashBuilder,
 }
@@ -85,7 +85,7 @@ impl OrderedTrieRootEncodedBuilder {
 
         match index {
             0 => {
-                self.zero = Some(Arc::from(bytes));
+                self.zero = Some(bytes.to_vec());
             }
             1..=0x7f => {
                 self.add_leaf(index, bytes);
@@ -132,7 +132,7 @@ impl OrderedTrieRootEncodedBuilder {
         }
 
         let zero = self.zero.take().expect("index 0 must be buffered before it is flushed");
-        self.add_leaf(0, zero.as_ref());
+        self.add_leaf(0, &zero);
     }
 
     fn add_leaf(&mut self, index: usize, bytes: &[u8]) {
@@ -144,7 +144,6 @@ impl OrderedTrieRootEncodedBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
     use alloy_trie::root::ordered_trie_root_encoded;
     use proptest::prelude::*;
 
@@ -270,21 +269,6 @@ mod tests {
             assert_eq!(left.finalize(), ordered_trie_root_encoded(&left_items));
             assert_eq!(right.finalize(), ordered_trie_root_encoded(&right_items));
         }
-    }
-
-    #[test]
-    fn clone_shares_large_buffered_zero_leaf() {
-        let first = vec![0x42; 1024 * 1024];
-        let mut builder = OrderedTrieRootEncodedBuilder::new();
-        builder.push_next(&first);
-
-        let clone = builder.clone();
-
-        assert!(Arc::ptr_eq(
-            builder.zero.as_ref().expect("first leaf is buffered"),
-            clone.zero.as_ref().expect("cloned first leaf is buffered"),
-        ));
-        assert_eq!(clone.finalize(), ordered_trie_root_encoded(&[first]));
     }
 
     proptest! {

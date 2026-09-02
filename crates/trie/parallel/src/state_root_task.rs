@@ -89,11 +89,11 @@ impl StateRootHandle {
         >,
         hashed_state_rx: std::sync::mpsc::Receiver<Arc<HashedPostState>>,
     ) -> Self {
-        let (authoritative, hint) = state_root_streams(updates_tx);
+        let sink: Arc<dyn StateRootSink> = Arc::new(SparseTrieStateRootSink::new(updates_tx));
         Self {
             cached_trie_state_root,
-            hint: Some(hint),
-            authoritative: Some(authoritative),
+            hint: Some(StateRootHintStream::new(Arc::clone(&sink))),
+            authoritative: Some(StateRootUpdateStream::new(sink)),
             cancel_guard,
             state_root_rx: Some(state_root_rx),
             hashed_state_rx: Some(hashed_state_rx),
@@ -489,22 +489,6 @@ impl StateRootSink for SparseTrieStateRootSink {
     fn on_updates_finished(&self) {
         let _ = self.sender.send(StateRootMessage::FinishedStateUpdates);
     }
-}
-
-/// Creates the authoritative and hint views for a sparse-trie update channel.
-pub fn state_root_streams(
-    sender: crossbeam_channel::Sender<StateRootMessage>,
-) -> (StateRootUpdateStream, StateRootHintStream) {
-    let sink: Arc<dyn StateRootSink> = Arc::new(SparseTrieStateRootSink::new(sender));
-    (StateRootUpdateStream::new(Arc::clone(&sink)), StateRootHintStream::new(sink))
-}
-
-/// Creates inert state-root streams for payload-builder tests.
-#[doc(hidden)]
-pub fn noop_state_root_streams() -> (StateRootUpdateStream, StateRootHintStream) {
-    let (sender, receiver) = crossbeam_channel::unbounded();
-    drop(receiver);
-    state_root_streams(sender)
 }
 
 /// Converts [`EvmState`] to [`HashedPostState`] by keccak256-hashing addresses and storage slots.

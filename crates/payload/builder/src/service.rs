@@ -5,7 +5,7 @@
 
 use crate::{
     metrics::PayloadBuilderServiceMetrics, traits::PayloadJobGenerator, KeepPayloadJobAlive,
-    PayloadJob, PayloadStateRootJobLauncher,
+    PayloadJob,
 };
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockTimestamp, B256};
@@ -16,8 +16,9 @@ use reth_execution_cache::SavedCache;
 use reth_payload_builder_primitives::{Events, PayloadBuilderError, PayloadEvents};
 use reth_payload_primitives::{BuiltPayload, PayloadAttributes, PayloadKind, PayloadTypes};
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
-use reth_trie_parallel::state_root_task::PayloadStateRootHandle;
+use reth_trie_parallel::state_root_task::{PayloadStateRootHandle, StateRootHandle};
 use std::{
+    fmt,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -575,6 +576,31 @@ impl<T: PayloadAttributes> BuildNewPayload<T> {
     }
 }
 
+/// Starts independent state-root jobs against one frozen parent view.
+///
+/// Every job shares the launcher's proof workers and pause leases; the launcher owns both until
+/// it is dropped.
+#[derive(Clone)]
+pub struct PayloadStateRootLauncher(Arc<dyn Fn() -> StateRootHandle + Send + Sync>);
+
+impl PayloadStateRootLauncher {
+    /// Wraps an engine-owned job constructor.
+    pub fn new(start: impl Fn() -> StateRootHandle + Send + Sync + 'static) -> Self {
+        Self(Arc::new(start))
+    }
+
+    /// Starts one job.
+    pub fn start(&self) -> StateRootHandle {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for PayloadStateRootLauncher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PayloadStateRootLauncher")
+    }
+}
+
 /// Resources loaned to a payload builder job by the engine.
 #[derive(Debug, Default)]
 pub struct PayloadBuilderResources {
@@ -585,7 +611,7 @@ pub struct PayloadBuilderResources {
     /// Optional standard single-build state-root handle.
     state_root_handle: Option<PayloadStateRootHandle>,
     /// Optional launcher for independent candidate state-root jobs.
-    candidate_state_root_launcher: Option<PayloadStateRootJobLauncher>,
+    candidate_state_root_launcher: Option<PayloadStateRootLauncher>,
     /// Lifecycle leases retained by the service or by detached payload build tasks.
     leases: Vec<PayloadBuilderLease>,
 }
@@ -604,15 +630,15 @@ impl PayloadBuilderResources {
         }
     }
 
-    /// Creates resources for a payload that may launch more than one candidate root job.
+    /// Creates resources for a payload that may start more than one candidate root job.
     pub const fn new_candidate(
         execution_cache: Option<SavedCache>,
-        state_root_jobs: PayloadStateRootJobLauncher,
+        state_root_launcher: PayloadStateRootLauncher,
     ) -> Self {
         Self {
             execution_cache,
             state_root_handle: None,
-            candidate_state_root_launcher: Some(state_root_jobs),
+            candidate_state_root_launcher: Some(state_root_launcher),
             leases: Vec::new(),
         }
     }
@@ -643,8 +669,8 @@ impl PayloadBuilderResources {
         self.state_root_handle.take()
     }
 
-    /// Takes the candidate state-root job launcher, if one was provided.
-    pub const fn take_state_root_job_launcher(&mut self) -> Option<PayloadStateRootJobLauncher> {
+    /// Takes the candidate state-root launcher, if one was provided.
+    pub const fn take_state_root_launcher(&mut self) -> Option<PayloadStateRootLauncher> {
         self.candidate_state_root_launcher.take()
     }
 
@@ -701,36 +727,6 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
         }
-    }
-
-    #[test]
-    fn wrong_state_root_accessor_leaves_resource_for_the_matching_consumer() {
-        let (_root_tx, root_rx) = std::sync::mpsc::channel();
-        let standard = PayloadStateRootHandle::new("test", None, root_rx, None);
-        let mut resources = PayloadBuilderResources::new(None, Some(standard));
-        assert!(resources.take_state_root_job_launcher().is_none());
-        assert!(resources.take_state_root_handle().is_some());
-
-        let launcher =
-            PayloadStateRootJobLauncher::new(|| unreachable!("test launcher is never started"));
-        let mut resources = PayloadBuilderResources::new_candidate(None, launcher);
-        assert!(resources.take_state_root_handle().is_none());
-        assert!(resources.take_state_root_job_launcher().is_some());
-    }
-
-    #[test]
-    fn extracted_candidate_launcher_does_not_retain_resource_leases() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let launcher =
-            PayloadStateRootJobLauncher::new(|| unreachable!("test launcher is never started"));
-        let mut resources = PayloadBuilderResources::new_candidate(None, launcher)
-            .with_lease(PayloadBuilderLease::new(DropProbe(Arc::clone(&dropped))));
-
-        let launcher = resources.take_state_root_job_launcher().unwrap();
-        drop(resources);
-
-        assert!(dropped.load(Ordering::Acquire));
-        drop(launcher);
     }
 
     #[test]

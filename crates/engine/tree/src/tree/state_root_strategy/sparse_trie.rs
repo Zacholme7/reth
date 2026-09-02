@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::{evm_state_to_hashed_post_state, StateRootComputeOutcome, StateRootMessage};
 use alloy_primitives::{
-    map::{hash_map::Entry, B256Map, B256Set},
+    map::{hash_map::Entry, B256Map},
     B256,
 };
 use alloy_rlp::{Decodable, Encodable};
@@ -68,8 +68,6 @@ pub(super) struct SparseTrieCacheTask<A = ArenaParallelSparseTrie, S = ArenaPara
     account_updates: B256Map<LeafUpdate>,
     /// Storage trie updates. hashed address -> slot -> update.
     storage_updates: B256Map<B256Map<LeafUpdate>>,
-    /// Storage tries whose pending updates just drained and may need one root computation.
-    drained_storage_updates: B256Set,
 
     /// Account updates that are buffered but were not yet applied to the trie.
     new_account_updates: B256Map<LeafUpdate>,
@@ -146,21 +144,17 @@ where
         parent_state_root: B256,
         new_epoch: TrieNodeEpoch,
         chunk_size: usize,
-        candidate: bool,
     ) -> Self {
         let (hashed_state_tx, hashed_state_rx) = crossbeam_channel::unbounded();
 
         let parent_span = tracing::Span::current();
         let hashing_metrics = metrics.clone();
-        let hashing_task = move || {
+        // Concurrent tasks (engine validation next to payload candidates) must not queue
+        // behind one named worker.
+        executor.spawn_blocking_named_or_tokio("trie-hashing", move || {
             let _span = trace_span!(parent: parent_span, "run_hashing_task").entered();
             Self::run_hashing_task(updates, hashed_state_tx, hashing_metrics)
-        };
-        if candidate {
-            executor.spawn_blocking_named_or_tokio("trie-hashing", hashing_task);
-        } else {
-            executor.spawn_blocking_named("trie-hashing", hashing_task);
-        }
+        });
 
         Self {
             proof_result_tx,
@@ -176,7 +170,6 @@ where
             max_targets_for_chunking: DEFAULT_MAX_TARGETS_FOR_CHUNKING,
             account_updates: Default::default(),
             storage_updates: Default::default(),
-            drained_storage_updates: Default::default(),
             new_account_updates: Default::default(),
             new_storage_updates: Default::default(),
             pending_account_updates: Default::default(),
@@ -667,10 +660,6 @@ where
             self.storage_cache_hits += (updates_len_before - updates_len_after) as u64;
             self.storage_cache_misses += updates_len_after as u64;
 
-            if updates_len_before != 0 && updates_len_after == 0 {
-                self.drained_storage_updates.insert(*address);
-            }
-
             if !targets.is_empty() {
                 self.pending_targets.extend_storage_targets(address, targets);
             }
@@ -731,7 +720,11 @@ where
     ///
     /// we trigger state root computation on a rayon pool.
     fn compute_drained_storage_roots(&mut self) {
-        let addresses_to_compute_roots: Vec<_> = self.drained_storage_updates.drain().collect();
+        let addresses_to_compute_roots: Vec<_> = self
+            .storage_updates
+            .iter()
+            .filter_map(|(address, updates)| updates.is_empty().then_some(*address))
+            .collect();
 
         struct SendStorageTriePtr<S>(*mut RevealableSparseTrie<S>);
         // SAFETY: this wrapper only forwards the pointer across rayon; deref invariants are
@@ -1274,7 +1267,6 @@ mod tests {
             parent_state_root,
             TrieNodeEpoch::UNMODIFIED,
             1,
-            false,
         );
 
         updates_tx.send(StateRootMessage::FinishedStateUpdates).unwrap();
@@ -1284,7 +1276,6 @@ mod tests {
 
         assert_eq!(outcome.state_root, parent_state_root);
         assert!(outcome.trie_updates.is_empty());
-        assert_eq!(Arc::strong_count(&outcome.hashed_state), 1);
         assert!(task.trie.state_trie_ref().is_none(), "blind trie should not be revealed");
 
         drop(task);
@@ -1330,7 +1321,6 @@ mod tests {
             B256::from([0x55; 32]),
             TrieNodeEpoch::UNMODIFIED,
             1,
-            false,
         );
 
         drop(updates_tx);
@@ -1419,7 +1409,6 @@ mod tests {
             B256::from([0x55; 32]),
             TrieNodeEpoch::UNMODIFIED,
             1,
-            false,
         );
 
         // The consumer abandons the computation. The updates channel is still open (no finish
@@ -1473,7 +1462,6 @@ mod tests {
             B256::from([0x55; 32]),
             TrieNodeEpoch::UNMODIFIED,
             1,
-            false,
         );
 
         updates_tx.send(StateRootMessage::FinishedStateUpdates).unwrap();
