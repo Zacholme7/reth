@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use super::{evm_state_to_hashed_post_state, StateRootComputeOutcome, StateRootMessage};
+use super::{
+    evm_state_to_hashed_post_state, ProofDispatcher, StateRootComputeOutcome, StateRootMessage,
+};
 use alloy_primitives::{
     map::{hash_map::Entry, B256Map},
     B256,
@@ -23,7 +25,6 @@ use reth_trie_parallel::{
     error::StateRootTaskError,
     proof_task::{
         AccountMultiproofInput, ProofResultContext, ProofResultMessage, ProofResultSender,
-        ProofWorkerHandle,
     },
 };
 use reth_trie_sparse::{
@@ -54,7 +55,7 @@ pub(super) struct SparseTrieCacheTask<A = ArenaParallelSparseTrie, S = ArenaPara
     /// The new epoch assigned to nodes modified by this task.
     new_epoch: TrieNodeEpoch,
     /// Handle to the proof worker pools (storage and account).
-    proof_worker_handle: ProofWorkerHandle,
+    proof_worker_handle: ProofDispatcher,
 
     /// The size of proof targets chunk to spawn in one calculation.
     /// If None, chunking is disabled and all targets are processed in a single proof.
@@ -136,7 +137,7 @@ where
         updates: CrossbeamReceiver<StateRootMessage>,
         cancel_rx: CrossbeamReceiver<()>,
         final_hashed_state_tx: std::sync::mpsc::Sender<Arc<HashedPostState>>,
-        proof_worker_handle: ProofWorkerHandle,
+        proof_worker_handle: ProofDispatcher,
         proof_result_tx: ProofResultSender,
         proof_result_rx: CrossbeamReceiver<ProofResultMessage>,
         metrics: SparseTrieTaskMetrics,
@@ -1125,7 +1126,7 @@ mod tests {
     use reth_db_common::init::init_genesis;
     use reth_provider::test_utils::create_test_provider_factory;
     use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
-    use reth_trie_parallel::proof_task::ProofTaskCtx;
+    use reth_trie_parallel::proof_task::{ProofTaskCtx, ProofWorkerHandle};
     use reth_trie_sparse::ArenaParallelSparseTrie;
 
     fn drain_sparse_trie_tasks(runtime: &Runtime) {
@@ -1259,7 +1260,7 @@ mod tests {
             updates_rx,
             cancel_rx,
             std::sync::mpsc::channel().0,
-            proof_worker_handle,
+            ProofDispatcher::Dedicated(proof_worker_handle),
             proof_result_tx,
             proof_result_rx,
             SparseTrieTaskMetrics::default(),
@@ -1313,7 +1314,7 @@ mod tests {
             updates_rx,
             cancel_rx,
             std::sync::mpsc::channel().0,
-            proof_worker_handle,
+            ProofDispatcher::Dedicated(proof_worker_handle),
             proof_result_tx,
             proof_result_rx,
             SparseTrieTaskMetrics::default(),
@@ -1401,7 +1402,7 @@ mod tests {
             updates_rx,
             cancel_rx,
             std::sync::mpsc::channel().0,
-            proof_worker_handle,
+            ProofDispatcher::Dedicated(proof_worker_handle),
             proof_result_tx,
             proof_result_rx,
             SparseTrieTaskMetrics::default(),
@@ -1454,7 +1455,7 @@ mod tests {
             updates_rx,
             cancel_rx,
             std::sync::mpsc::channel().0,
-            proof_worker_handle,
+            ProofDispatcher::Dedicated(proof_worker_handle),
             proof_result_tx,
             proof_result_rx,
             SparseTrieTaskMetrics::default(),

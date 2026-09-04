@@ -125,7 +125,6 @@ pub mod test_utils;
 pub use alloy_rpc_types::engine::PayloadId;
 pub use reth_payload_builder_primitives::PayloadBuilderError;
 pub use reth_payload_primitives::PayloadKind;
-pub use reth_trie_parallel::state_root_task::{StateRootComputeOutcome, StateRootHandle};
 pub use service::{
     BuildNewPayload, PayloadBuilderHandle, PayloadBuilderLease, PayloadBuilderResources,
     PayloadBuilderService, PayloadServiceCommand, PayloadStateRootLauncher, PayloadStore,

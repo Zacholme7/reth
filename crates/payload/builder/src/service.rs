@@ -578,8 +578,7 @@ impl<T: PayloadAttributes> BuildNewPayload<T> {
 
 /// Starts independent state-root jobs against one frozen parent view.
 ///
-/// Every job shares the launcher's proof workers and pause leases; the launcher owns both until
-/// it is dropped.
+/// Jobs share an exact-parent provider and pause lease. Idle launchers reserve no worker threads.
 #[derive(Clone)]
 pub struct PayloadStateRootLauncher(Arc<dyn Fn() -> StateRootHandle + Send + Sync>);
 

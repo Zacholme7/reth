@@ -73,6 +73,7 @@ reth-stages = { workspace = true, optional = true }
 reth-static-file = { workspace = true, optional = true }
 reth-tracing = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 [dev-dependencies]
 # reth
@@ -132,6 +133,7 @@ test-utils = [
     "reth-evm-ethereum/test-utils",
 ]
 trie-debug = [
+    "dep:rand",
     "reth-trie-sparse/trie-debug",
     "reth-trie-parallel/trie-debug",
     "reth-engine-primitives/trie-debug",

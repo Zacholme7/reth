@@ -231,10 +231,10 @@ impl<'a, N: NodePrimitives> TreeCtx<'a, N> {
 /// Validation still queues JIT work and can use resident compiled code, but helper execution is
 /// paused during validation to minimize latency. Queued work resumes when validation exits, so JIT
 /// compilation is biased toward idle periods instead of competing with payload validation.
-pub(super) struct JitPauseGuard<Evm: ConfigureEvm>(Evm);
+struct JitPauseGuard<Evm: ConfigureEvm>(Evm);
 
 impl<Evm: ConfigureEvm> JitPauseGuard<Evm> {
-    pub(super) fn new(evm_config: &Evm) -> Self {
+    fn new(evm_config: &Evm) -> Self {
         if let Some(jit_backend) = evm_config.jit_backend() {
             jit_backend.pause();
         }
@@ -294,7 +294,7 @@ where
     ///
     /// None if txpool prewarming is disabled.
     #[debug(skip)]
-    txpool_prewarm: Option<Arc<txpool_prewarm::Handle<Evm::Primitives, P, Evm>>>,
+    txpool_prewarm: Option<txpool_prewarm::Handle<Evm::Primitives, P, Evm>>,
     /// Opt-in independent payload state-root construction.
     candidate_mode: Option<DefaultStateRootStrategy>,
 }
@@ -317,7 +317,7 @@ where
         + StateReader
         + Clone
         + 'static,
-    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
+    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory + Send>
         + Clone
         + 'static,
     Evm: ConfigureEvm<Primitives = N> + 'static,
@@ -383,11 +383,11 @@ where
         mut self,
         source: impl crate::tree::TxPoolPrewarmSource<N> + 'static,
     ) -> Self {
-        self.txpool_prewarm = Some(Arc::new(txpool_prewarm::Handle::spawn(
+        self.txpool_prewarm = Some(txpool_prewarm::Handle::spawn(
             &self.runtime,
             Arc::new(source),
             self.evm_config.clone(),
-        )));
+        ));
         self
     }
 
@@ -487,7 +487,7 @@ where
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
     {
         let parent_hash = input.parent_hash();
-        let _txpool_pause = self.txpool_prewarm.as_ref().map(|handle| handle.pause());
+        let _txpool_pause = self.txpool_prewarm.as_ref().map(txpool_prewarm::Handle::pause);
         let txpool_snapshot =
             self.txpool_prewarm.as_ref().and_then(|prewarmer| prewarmer.snapshot(parent_hash));
         let _jit_pause = JitPauseGuard::new(&self.evm_config);
@@ -1800,7 +1800,7 @@ where
         + ChangeSetReader
         + Clone
         + 'static,
-    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
+    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory + Send>
         + Clone
         + 'static,
     N: NodePrimitives,
@@ -1926,14 +1926,16 @@ where
             );
             return PayloadBuilderResources::new_candidate(
                 execution_cache,
-                strategy.candidate_payload_builder_launcher(
+                strategy.candidate_payload_builder_launcher::<N, _>(
                     &self.runtime,
                     parent_hash,
                     parent_header,
                     overlay_factory,
                     &self.config,
-                    self.evm_config.clone(),
-                    self.txpool_prewarm.clone(),
+                    PayloadBuilderLease::new((
+                        JitPauseGuard::new(&self.evm_config),
+                        self.txpool_prewarm.as_ref().map(txpool_prewarm::Handle::pause),
+                    )),
                 ),
             );
         }

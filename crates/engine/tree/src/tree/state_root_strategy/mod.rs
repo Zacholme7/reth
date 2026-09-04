@@ -53,27 +53,28 @@
 //! `eth_getProof` and anything else that reads the stored trie will not work for new blocks.
 //! Sparse-trie cache pruning uses node epochs to retain the in-memory block range.
 
+#[cfg(test)]
+mod candidate_tests;
 mod sparse_trie;
 
 use self::sparse_trie::{SparseTrieCacheTask, SparseTrieTaskMetrics};
 use crate::tree::{
-    metrics::BlockValidationMetrics, payload_validator::JitPauseGuard, txpool_prewarm,
-    EngineApiTreeState, ExecutionEnv, StateProviderBuilder, TreeConfig,
+    metrics::BlockValidationMetrics, EngineApiTreeState, ExecutionEnv, StateProviderBuilder,
+    TreeConfig,
 };
 use alloy_primitives::B256;
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use reth_chain_state::{ExecutedBlock, PreservedSparseTrie};
 use reth_errors::ProviderResult;
 use reth_evm::{ConfigureEvm, OnStateHook};
-use reth_payload_builder::PayloadStateRootLauncher;
+use reth_payload_builder::{PayloadBuilderLease, PayloadStateRootLauncher};
 use reth_primitives_traits::{
     AlloyBlockHeader, FastInstant as Instant, NodePrimitives, RecoveredBlock, SealedHeader,
 };
 use reth_provider::{
-    BlockExecutionOutput, BlockNumReader, ChangeSetReader, DatabaseProviderFactory,
-    DatabaseProviderROFactory, HashedPostStateProvider, ProviderError, PruneCheckpointReader,
-    StageCheckpointReader, StateRootProvider, StorageChangeSetReader, StorageSettingsCache,
-    TryIntoHistoricalStateProvider,
+    BlockExecutionOutput, BlockNumReader, DatabaseProviderFactory, DatabaseProviderROFactory,
+    HashedPostStateProvider, ProviderError, PruneCheckpointReader, StageCheckpointReader,
+    StateRootProvider, StorageSettingsCache, TryIntoHistoricalStateProvider,
 };
 use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
 use reth_tasks::utils::increase_thread_priority;
@@ -81,7 +82,9 @@ use reth_trie::{
     hashed_cursor::HashedCursorFactory, trie_cursor::TrieCursorFactory, updates::TrieUpdates,
     HashedPostState,
 };
-use reth_trie_parallel::proof_task::{ProofResultMessage, ProofTaskCtx, ProofWorkerHandle};
+use reth_trie_parallel::proof_task::{
+    AccountMultiproofInput, ProofResultMessage, ProofTaskCtx, ProofTaskTx, ProofWorkerHandle,
+};
 pub use reth_trie_parallel::{
     error::StateRootTaskError,
     state_root_task::{
@@ -511,57 +514,80 @@ impl DefaultStateRootStrategy {
     /// produce fewer state changes and most workers would be idle overhead.
     const SMALL_BLOCK_PROOF_WORKER_TX_THRESHOLD: usize = 30;
 
-    /// Creates a launcher for independent, non-preserving payload-builder root jobs.
-    ///
-    /// Every job shares one proof worker set and one JIT/prewarm pause, both released with the
-    /// launcher.
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn candidate_payload_builder_launcher<N, P, Evm>(
+    /// Creates independent root jobs sharing exact-parent provider views and a pause lease.
+    pub(crate) fn candidate_payload_builder_launcher<N, F>(
         &self,
         executor: &reth_tasks::Runtime,
         parent_hash: B256,
         parent_header: &N::BlockHeader,
-        overlay_factory: OverlayStateProviderFactory<P, N>,
+        factory: F,
         config: &TreeConfig,
-        evm_config: Evm,
-        txpool_prewarm: Option<Arc<txpool_prewarm::Handle<N, P, Evm>>>,
+        lease: PayloadBuilderLease,
     ) -> PayloadStateRootLauncher
     where
         N: NodePrimitives,
-        P: DatabaseProviderFactory + Clone + 'static,
-        P::Provider: BlockNumReader
-            + ChangeSetReader
-            + PruneCheckpointReader
-            + StageCheckpointReader
-            + StorageChangeSetReader
-            + StorageSettingsCache
-            + TryIntoHistoricalStateProvider
-            + 'static,
-        OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory>
+        F: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory + Send>
             + Clone
+            + Send
+            + Sync
             + 'static,
-        Evm: ConfigureEvm<Primitives = N> + 'static,
     {
         let strategy = self.clone();
         let executor = executor.clone();
         let config = config.clone();
         let parent_header = SealedHeader::new(parent_header.clone(), parent_hash);
-        let task_ctx = ProofTaskCtx::new(overlay_factory);
+        let factory = Arc::new(factory);
+        let providers = Arc::new(std::sync::OnceLock::new());
+        let storage_roots = Arc::default();
+        let worker_count = executor.cpu_pool().current_num_threads();
+        let proof_executor = executor.clone();
+        let parallel = worker_count > 1;
         #[cfg(feature = "trie-debug")]
-        let task_ctx = task_ctx.with_proof_jitter(config.proof_jitter());
-        // Worker start-up failures surface as dispatch errors on the jobs themselves.
-        let (worker_failures, _) = crossbeam_channel::unbounded();
-        let proof_handle = ProofWorkerHandle::new(&executor, task_ctx, true, worker_failures);
-        let lease =
-            (JitPauseGuard::new(&evm_config), txpool_prewarm.as_ref().map(|handle| handle.pause()));
+        let proof_jitter = config.proof_jitter();
+        let dispatch = Arc::new(move |input: AccountMultiproofInput| {
+            let providers = Arc::clone(&providers);
+            let storage_roots = Arc::clone(&storage_roots);
+            let factory = Arc::clone(&factory);
+            let lease = lease.clone();
+            proof_executor.cpu_pool().spawn(move || {
+                let _lease = lease;
+                #[cfg(feature = "trie-debug")]
+                if let Some(max_jitter) = proof_jitter {
+                    std::thread::sleep(Duration::from_nanos(rand::random_range(
+                        0..=max_jitter.as_nanos() as u64,
+                    )));
+                }
+                let AccountMultiproofInput { targets, proof_result_sender } = input;
+                // Pin one view per CPU worker. Views survive idle streams without occupying
+                // worker threads, and each proof reuses its worker's uncontended transaction.
+                let result = providers
+                    .get_or_init(|| {
+                        (0..worker_count)
+                            .map(|_| factory.database_provider_ro().map(parking_lot::Mutex::new))
+                            .collect::<ProviderResult<Vec<_>>>()
+                    })
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .map_err(StateRootTaskError::from)
+                    .and_then(|providers| {
+                        let worker_id = rayon::current_thread_index().expect("CPU pool worker");
+                        let provider = providers[worker_id].lock();
+                        ProofTaskTx::new(&*provider, worker_id)
+                            .multiproof_v2(targets, storage_roots)
+                    });
+                let _ = proof_result_sender.sender.send(ProofResultMessage {
+                    result,
+                    elapsed: proof_result_sender.start_time.elapsed(),
+                    state: proof_result_sender.state,
+                });
+            });
+        });
 
         PayloadStateRootLauncher::new(move || {
-            // Referenced so the closure owns the pause for the launcher's lifetime.
-            let _lease = &lease;
-            let mut handle = strategy.spawn_state_root::<N, OverlayStateProviderFactory<P, N>>(
+            let mut handle = strategy.spawn_state_root::<N, F>(
                 &executor,
                 None,
-                ProofWorkers::Shared(proof_handle.clone()),
+                ProofWorkers::Detached { dispatch: dispatch.clone(), parallel },
                 StateRootTaskOptions {
                     parent_header: parent_header.clone(),
                     preserved_sparse_trie: None,
@@ -570,8 +596,7 @@ impl DefaultStateRootStrategy {
                     pending_sparse_trie_prune_blocks: None,
                 },
             );
-            // A candidate never consumes the hashed state; dropping its receiver keeps the
-            // outcome uniquely owned by the caller.
+            // The outcome is the candidate's only owner of the hashed state.
             drop(handle.take_hashed_state_rx());
             handle
         })
@@ -584,7 +609,7 @@ impl DefaultStateRootStrategy {
     /// An unknown transaction count uses the full proof-worker pool.
     ///
     /// `overlay_manager` is `None` for detached candidate jobs, which never publish their trie
-    /// and may share their proof workers with sibling candidates.
+    /// and dispatch finite proof batches on the CPU pool.
     #[instrument(level = "debug", target = "engine::tree::payload_processor", skip_all)]
     fn spawn_state_root<N, F>(
         &self,
@@ -620,9 +645,16 @@ impl DefaultStateRootStrategy {
                 let task_ctx = task_ctx.with_proof_jitter(config.proof_jitter());
                 let halve_workers = transaction_count
                     .is_some_and(|count| count <= Self::SMALL_BLOCK_PROOF_WORKER_TX_THRESHOLD);
-                ProofWorkerHandle::new(executor, task_ctx, halve_workers, proof_result_tx.clone())
+                ProofDispatcher::Dedicated(ProofWorkerHandle::new(
+                    executor,
+                    task_ctx,
+                    halve_workers,
+                    proof_result_tx.clone(),
+                ))
             }
-            ProofWorkers::Shared(handle) => handle,
+            ProofWorkers::Detached { dispatch, parallel } => {
+                ProofDispatcher::Detached { dispatch, parallel }
+            }
         };
 
         let (state_root_tx, state_root_rx) = mpsc::channel();
@@ -669,7 +701,7 @@ impl DefaultStateRootStrategy {
         &self,
         executor: &reth_tasks::Runtime,
         overlay_manager: Option<&OverlayManager<N>>,
-        proof_worker_handle: ProofWorkerHandle,
+        proof_worker_handle: ProofDispatcher,
         proof_result_tx: CrossbeamSender<ProofResultMessage>,
         proof_result_rx: CrossbeamReceiver<ProofResultMessage>,
         state_root_tx: mpsc::Sender<Result<StateRootComputeOutcome, StateRootTaskError>>,
@@ -865,8 +897,41 @@ struct SparseTrieTaskOptions<N: NodePrimitives> {
 enum ProofWorkers<F> {
     /// Spawn a worker set sized for this task.
     Fresh(F),
-    /// Reuse a launcher-owned worker set shared by sibling candidates.
-    Shared(ProofWorkerHandle),
+    /// Finite proof jobs for detached candidates.
+    Detached { dispatch: Arc<dyn Fn(AccountMultiproofInput) + Send + Sync>, parallel: bool },
+}
+
+/// Validation retains its native proof workers; detached candidates only occupy pool threads
+/// while calculating a proof, so idle streams and launchers cannot starve other roots.
+enum ProofDispatcher {
+    Dedicated(ProofWorkerHandle),
+    Detached { dispatch: Arc<dyn Fn(AccountMultiproofInput) + Send + Sync>, parallel: bool },
+}
+
+impl ProofDispatcher {
+    fn has_multiple_idle_account_workers(&self) -> bool {
+        match self {
+            Self::Dedicated(handle) => handle.has_multiple_idle_account_workers(),
+            Self::Detached { parallel, .. } => *parallel,
+        }
+    }
+
+    fn has_multiple_idle_storage_workers(&self) -> bool {
+        match self {
+            Self::Dedicated(handle) => handle.has_multiple_idle_storage_workers(),
+            Self::Detached { .. } => false,
+        }
+    }
+
+    fn dispatch_account_multiproof(&self, input: AccountMultiproofInput) -> ProviderResult<()> {
+        match self {
+            Self::Dedicated(handle) => handle.dispatch_account_multiproof(input),
+            Self::Detached { dispatch, .. } => {
+                dispatch(input);
+                Ok(())
+            }
+        }
+    }
 }
 
 struct StateRootTaskOptions<'a, N: NodePrimitives> {
@@ -1473,15 +1538,15 @@ mod tests {
             factory.clone(),
             overlay_manager.overlay_builder(genesis_hash),
         );
-        let launcher = DefaultStateRootStrategy::default().candidate_payload_builder_launcher(
-            &RUNTIME.clone(),
-            genesis_hash,
-            factory.sealed_header(0).unwrap().unwrap().header(),
-            overlay_factory,
-            &TreeConfig::default(),
-            reth_evm_ethereum::EthEvmConfig::new(chain_spec),
-            None,
-        );
+        let launcher = DefaultStateRootStrategy::default()
+            .candidate_payload_builder_launcher::<EthPrimitives, _>(
+                &RUNTIME.clone(),
+                genesis_hash,
+                factory.sealed_header(0).unwrap().unwrap().header(),
+                overlay_factory,
+                &TreeConfig::default(),
+                PayloadBuilderLease::new(()),
+            );
 
         for _ in 0..2 {
             let mut handle = launcher.start();
