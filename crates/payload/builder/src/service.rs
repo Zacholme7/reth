@@ -16,9 +16,8 @@ use reth_execution_cache::SavedCache;
 use reth_payload_builder_primitives::{Events, PayloadBuilderError, PayloadEvents};
 use reth_payload_primitives::{BuiltPayload, PayloadAttributes, PayloadKind, PayloadTypes};
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
-use reth_trie_parallel::state_root_task::{PayloadStateRootHandle, StateRootHandle};
+use reth_trie_parallel::state_root_task::PayloadStateRootHandle;
 use std::{
-    fmt,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -576,30 +575,6 @@ impl<T: PayloadAttributes> BuildNewPayload<T> {
     }
 }
 
-/// Starts independent state-root jobs against one frozen parent view.
-///
-/// Jobs share an exact-parent provider and pause lease. Idle launchers reserve no worker threads.
-#[derive(Clone)]
-pub struct PayloadStateRootLauncher(Arc<dyn Fn() -> StateRootHandle + Send + Sync>);
-
-impl PayloadStateRootLauncher {
-    /// Wraps an engine-owned job constructor.
-    pub fn new(start: impl Fn() -> StateRootHandle + Send + Sync + 'static) -> Self {
-        Self(Arc::new(start))
-    }
-
-    /// Starts one job.
-    pub fn start(&self) -> StateRootHandle {
-        (self.0)()
-    }
-}
-
-impl fmt::Debug for PayloadStateRootLauncher {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("PayloadStateRootLauncher")
-    }
-}
-
 /// Resources loaned to a payload builder job by the engine.
 #[derive(Debug, Default)]
 pub struct PayloadBuilderResources {
@@ -607,10 +582,8 @@ pub struct PayloadBuilderResources {
     ///
     /// Only provided if `--engine.share-execution-cache-with-payload-builder` is enabled.
     execution_cache: Option<SavedCache>,
-    /// Optional standard single-build state-root handle.
+    /// Optional handle to a background state-root task.
     state_root_handle: Option<PayloadStateRootHandle>,
-    /// Optional launcher for independent candidate state-root jobs.
-    candidate_state_root_launcher: Option<PayloadStateRootLauncher>,
     /// Lifecycle leases retained by the service or by detached payload build tasks.
     leases: Vec<PayloadBuilderLease>,
 }
@@ -621,25 +594,7 @@ impl PayloadBuilderResources {
         execution_cache: Option<SavedCache>,
         state_root_handle: Option<PayloadStateRootHandle>,
     ) -> Self {
-        Self {
-            execution_cache,
-            state_root_handle,
-            candidate_state_root_launcher: None,
-            leases: Vec::new(),
-        }
-    }
-
-    /// Creates resources for a payload that may start more than one candidate root job.
-    pub const fn new_candidate(
-        execution_cache: Option<SavedCache>,
-        state_root_launcher: PayloadStateRootLauncher,
-    ) -> Self {
-        Self {
-            execution_cache,
-            state_root_handle: None,
-            candidate_state_root_launcher: Some(state_root_launcher),
-            leases: Vec::new(),
-        }
+        Self { execution_cache, state_root_handle, leases: Vec::new() }
     }
 
     /// Adds a lease for this payload build.
@@ -666,11 +621,6 @@ impl PayloadBuilderResources {
     /// Takes the loaned state-root task handle, if any.
     pub const fn take_state_root_handle(&mut self) -> Option<PayloadStateRootHandle> {
         self.state_root_handle.take()
-    }
-
-    /// Takes the candidate state-root launcher, if one was provided.
-    pub const fn take_state_root_launcher(&mut self) -> Option<PayloadStateRootLauncher> {
-        self.candidate_state_root_launcher.take()
     }
 
     /// Takes lifecycle leases for a payload job that owns detached work.

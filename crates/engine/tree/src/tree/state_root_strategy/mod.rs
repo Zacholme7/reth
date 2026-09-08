@@ -67,7 +67,6 @@ use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender
 use reth_chain_state::{ExecutedBlock, PreservedSparseTrie};
 use reth_errors::ProviderResult;
 use reth_evm::{ConfigureEvm, OnStateHook};
-use reth_payload_builder::{PayloadBuilderLease, PayloadStateRootLauncher};
 use reth_primitives_traits::{
     AlloyBlockHeader, FastInstant as Instant, NodePrimitives, RecoveredBlock, SealedHeader,
 };
@@ -238,6 +237,19 @@ where
         self.provider_builder.clone()
     }
 
+    /// Returns a clone of the exact-parent overlay provider factory.
+    pub fn overlay_factory(&self) -> OverlayStateProviderFactory<P, N>
+    where
+        P: Clone,
+    {
+        self.overlay_factory.clone()
+    }
+
+    /// Returns the engine tree configuration.
+    pub const fn config(&self) -> &TreeConfig {
+        self.config
+    }
+
     /// Consumes the pending sparse trie prune request as in-memory parent-chain blocks, if any.
     ///
     /// Custom strategies that maintain a reusable sparse trie should call this when starting the
@@ -334,6 +346,19 @@ where
         P: Clone,
     {
         self.provider_builder.clone()
+    }
+
+    /// Returns a clone of the exact-parent overlay provider factory.
+    pub fn overlay_factory(&self) -> OverlayStateProviderFactory<P, N>
+    where
+        P: Clone,
+    {
+        self.overlay_factory.clone()
+    }
+
+    /// Returns the engine tree configuration.
+    pub const fn config(&self) -> &TreeConfig {
+        self.config
     }
 
     /// Consumes the pending sparse trie prune request as in-memory parent-chain blocks, if any.
@@ -514,16 +539,18 @@ impl DefaultStateRootStrategy {
     /// produce fewer state changes and most workers would be idle overhead.
     const SMALL_BLOCK_PROOF_WORKER_TX_THRESHOLD: usize = 30;
 
-    /// Creates independent root jobs sharing exact-parent provider views and a pause lease.
-    pub(crate) fn candidate_payload_builder_launcher<N, F>(
+    /// Creates a launcher for independent, non-preserving root jobs over one exact parent.
+    ///
+    /// Jobs share pinned provider views and dispatch finite proof batches on the CPU pool, so
+    /// idle launchers reserve no worker threads. Callers own the launcher's lifecycle.
+    pub fn candidate_payload_builder_launcher<N, F>(
         &self,
         executor: &reth_tasks::Runtime,
         parent_hash: B256,
         parent_header: &N::BlockHeader,
         factory: F,
         config: &TreeConfig,
-        lease: PayloadBuilderLease,
-    ) -> PayloadStateRootLauncher
+    ) -> Arc<dyn Fn() -> StateRootHandle + Send + Sync>
     where
         N: NodePrimitives,
         F: DatabaseProviderROFactory<Provider: TrieCursorFactory + HashedCursorFactory + Send>
@@ -548,9 +575,7 @@ impl DefaultStateRootStrategy {
             let providers = Arc::clone(&providers);
             let storage_roots = Arc::clone(&storage_roots);
             let factory = Arc::clone(&factory);
-            let lease = lease.clone();
             proof_executor.cpu_pool().spawn(move || {
-                let _lease = lease;
                 #[cfg(feature = "trie-debug")]
                 if let Some(max_jitter) = proof_jitter {
                     std::thread::sleep(Duration::from_nanos(rand::random_range(
@@ -583,7 +608,7 @@ impl DefaultStateRootStrategy {
             });
         });
 
-        PayloadStateRootLauncher::new(move || {
+        Arc::new(move || {
             let mut handle = strategy.spawn_state_root::<N, F>(
                 &executor,
                 None,
@@ -1545,11 +1570,10 @@ mod tests {
                 factory.sealed_header(0).unwrap().unwrap().header(),
                 overlay_factory,
                 &TreeConfig::default(),
-                PayloadBuilderLease::new(()),
             );
 
         for _ in 0..2 {
-            let mut handle = launcher.start();
+            let mut handle = launcher();
             drop(handle.take_execution_hook());
             let outcome =
                 tokio::task::spawn_blocking(move || handle.state_root()).await.unwrap().unwrap();

@@ -1423,20 +1423,12 @@ pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone 
 pub struct BasicEngineValidatorBuilder<EV> {
     /// The payload validator builder used to create the engine validator.
     payload_validator_builder: EV,
-    /// Whether payloads use independent state-root jobs.
-    candidate_payload_state_roots: bool,
 }
 
 impl<EV> BasicEngineValidatorBuilder<EV> {
     /// Creates a new instance with the given payload validator builder.
     pub const fn new(payload_validator_builder: EV) -> Self {
-        Self { payload_validator_builder, candidate_payload_state_roots: false }
-    }
-
-    /// Enables independent payload state-root jobs.
-    pub const fn with_candidate_payload_state_roots(mut self) -> Self {
-        self.candidate_payload_state_roots = true;
-        self
+        Self { payload_validator_builder }
     }
 }
 
@@ -1470,7 +1462,6 @@ where
         tree_config: TreeConfig,
         overlay_manager: OverlayManager<PrimitivesTy<Node::Types>>,
     ) -> eyre::Result<Self::EngineValidator> {
-        let candidate_payload_state_roots = self.candidate_payload_state_roots;
         let validator = self.payload_validator_builder.build(ctx).await?;
         let data_dir = ctx.config.datadir.clone().resolve_datadir(ctx.config.chain.chain());
         let invalid_block_hook = ctx.create_invalid_block_hook(&data_dir).await?;
@@ -1490,9 +1481,6 @@ where
         if txpool_prewarming {
             validator = validator
                 .with_txpool_prewarming(txpool_prewarm::Source::new(ctx.node.pool().clone()));
-        }
-        if candidate_payload_state_roots {
-            validator = validator.with_candidate_payload_state_roots();
         }
 
         Ok(validator)

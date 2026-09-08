@@ -127,7 +127,7 @@ pub use reth_payload_builder_primitives::PayloadBuilderError;
 pub use reth_payload_primitives::PayloadKind;
 pub use service::{
     BuildNewPayload, PayloadBuilderHandle, PayloadBuilderLease, PayloadBuilderResources,
-    PayloadBuilderService, PayloadServiceCommand, PayloadStateRootLauncher, PayloadStore,
+    PayloadBuilderService, PayloadServiceCommand, PayloadStore,
 };
 pub use traits::{KeepPayloadJobAlive, PayloadJob, PayloadJobGenerator};
 

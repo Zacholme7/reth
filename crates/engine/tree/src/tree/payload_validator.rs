@@ -295,8 +295,6 @@ where
     /// None if txpool prewarming is disabled.
     #[debug(skip)]
     txpool_prewarm: Option<txpool_prewarm::Handle<Evm::Primitives, P, Evm>>,
-    /// Opt-in independent payload state-root construction.
-    candidate_mode: Option<DefaultStateRootStrategy>,
 }
 
 impl<N, P, Evm, V> BasicEngineValidator<P, Evm, V>
@@ -356,7 +354,6 @@ where
             overlay_manager,
             state_root_strategy: Arc::new(DefaultStateRootStrategy::default()),
             txpool_prewarm: None,
-            candidate_mode: None,
         }
     }
 
@@ -366,15 +363,6 @@ where
         state_root_strategy: Arc<dyn StateRootStrategy<N, P, Evm>>,
     ) -> Self {
         self.state_root_strategy = state_root_strategy;
-        self
-    }
-
-    /// Installs the non-preserving candidate-root pipeline used by multi-build payload jobs.
-    ///
-    /// This is an API-level construction choice. Generic and non-Ethereum validators retain the
-    /// standard payload-builder state-root path.
-    pub fn with_candidate_payload_state_roots(mut self) -> Self {
-        self.candidate_mode = Some(DefaultStateRootStrategy::default());
         self
     }
 
@@ -1918,27 +1906,6 @@ where
             .config
             .share_execution_cache_with_payload_builder()
             .then(|| self.payload_processor.cache_for(parent_hash));
-
-        if let Some(strategy) = &self.candidate_mode {
-            let overlay_factory = OverlayStateProviderFactory::new(
-                self.provider.clone(),
-                state.tree_state.overlay_manager.overlay_builder(parent_hash),
-            );
-            return PayloadBuilderResources::new_candidate(
-                execution_cache,
-                strategy.candidate_payload_builder_launcher::<N, _>(
-                    &self.runtime,
-                    parent_hash,
-                    parent_header,
-                    overlay_factory,
-                    &self.config,
-                    PayloadBuilderLease::new((
-                        JitPauseGuard::new(&self.evm_config),
-                        self.txpool_prewarm.as_ref().map(txpool_prewarm::Handle::pause),
-                    )),
-                ),
-            );
-        }
 
         let state_root_handle =
             self.payload_state_root_handle_for(parent_hash, parent_header, timestamp, state);

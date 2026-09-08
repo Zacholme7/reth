@@ -41,17 +41,16 @@ fn idle_launchers_do_not_starve_validation() {
             parent.header(),
             overlay.clone(),
             &TreeConfig::default(),
-            PayloadBuilderLease::new(()),
         )
     };
     let first = launch();
-    let mut first_job = first.start();
+    let mut first_job = first();
     submit(&mut first_job, 1);
     let first_rx = first_job.take_state_root_rx();
     assert!(first_rx.recv_timeout(Duration::from_secs(3)).unwrap().is_ok());
     drop(first_job);
     let second = launch();
-    let mut second_job = second.start();
+    let mut second_job = second();
     submit(&mut second_job, 2);
     let second_rx = second_job.take_state_root_rx();
     assert!(second_rx.recv_timeout(Duration::from_secs(3)).unwrap().is_ok());
@@ -122,9 +121,8 @@ fn provider_open_failure_reaches_candidate() {
             parent.header(),
             overlay,
             &TreeConfig::default(),
-            PayloadBuilderLease::new(()),
         );
-    let mut job = launcher.start();
+    let mut job = launcher();
     submit(&mut job, 1);
     let rx = job.take_state_root_rx();
     opened_rx.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -133,7 +131,7 @@ fn provider_open_failure_reaches_candidate() {
     let error =
         rx.recv_timeout(Duration::from_secs(3)).expect("provider error was lost").unwrap_err();
     assert!(matches!(error, StateRootTaskError::Provider(_)));
-    let mut next = launcher.start();
+    let mut next = launcher();
     submit(&mut next, 2);
     assert!(next.take_state_root_rx().recv_timeout(Duration::from_secs(3)).unwrap().is_err());
     assert!(opened_rx.is_empty(), "a failed parent view must report its cached error");
@@ -154,13 +152,6 @@ fn concurrent_candidates_match_serial_roots_and_cancel_independently() {
         ObservedFactory { inner: factory, opened: opened_tx, release: None },
         manager.overlay_builder(hash),
     );
-    struct Lease(std::sync::mpsc::Sender<()>);
-    impl Drop for Lease {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
-    let (lease_tx, lease_rx) = std::sync::mpsc::channel();
     let launcher = DefaultStateRootStrategy::default()
         .candidate_payload_builder_launcher::<EthPrimitives, _>(
             &runtime,
@@ -168,14 +159,13 @@ fn concurrent_candidates_match_serial_roots_and_cancel_independently() {
             parent.header(),
             overlay,
             &TreeConfig::default(),
-            PayloadBuilderLease::new(Lease(lease_tx)),
         );
-    let mut canceled = launcher.start();
+    let mut canceled = launcher();
     let unfinished_hook = canceled.take_execution_hook();
     let canceled_rx = canceled.take_state_root_rx();
     let jobs: Vec<_> = (1..=8)
         .map(|balance| {
-            let mut job = launcher.start();
+            let mut job = launcher();
             submit(&mut job, balance);
             let rx = job.take_state_root_rx();
             (balance, job, rx)
@@ -204,18 +194,16 @@ fn concurrent_candidates_match_serial_roots_and_cancel_independently() {
         assert_eq!(Arc::strong_count(&outcome.trie_updates), 1);
     }
     assert_eq!(opened_rx.len(), runtime.cpu_pool().current_num_threads());
-    let mut last = launcher.start();
+    let mut last = launcher();
     let hook = last.take_execution_hook();
     let result = last.take_state_root_rx();
     drop(launcher);
-    assert!(lease_rx.try_recv().is_err(), "an active job must retain its pause");
     drop(last);
     assert!(matches!(
         result.recv_timeout(Duration::from_secs(3)).unwrap(),
         Err(StateRootTaskError::Canceled)
     ));
     drop(hook);
-    lease_rx.recv_timeout(Duration::from_secs(3)).expect("canceled job leaked its pause");
 }
 
 #[test]
@@ -273,9 +261,8 @@ fn populated_parent_matches_serial_root() {
             parent.header(),
             OverlayStateProviderFactory::new(factory, manager.overlay_builder(hash)),
             &TreeConfig::default(),
-            PayloadBuilderLease::new(()),
         );
-    let mut job = launcher.start();
+    let mut job = launcher();
     let mut hook = job.take_execution_hook();
     hook.on_state(updates);
     drop(hook);
